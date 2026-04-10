@@ -123,8 +123,8 @@ def _emoji_matches_rule(stored: str | None, emoji: discord.PartialEmoji) -> bool
 
 
 intents = discord.Intents.default()
-intents.members = True
-
+# Server Members Intent is not required: role changes use REST when the member
+# isn't cached. Enable it in the Developer Portal only if you add features that need member lists.
 
 class Bot(commands.Bot):
     async def setup_hook(self) -> None:
@@ -405,8 +405,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if not matched:
         return
 
-    member = await _get_member(guild, payload.user_id)
-    if member is None or member.bot:
+    if not await _reaction_user_is_human(guild, payload.user_id):
         return
 
     for r in matched:
@@ -418,7 +417,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         if role is None:
             continue
         try:
-            await member.add_roles(role, reason="Opt-in via reaction (reminder bot)")
+            await _add_role(guild, payload.user_id, role, "Opt-in via reaction (reminder bot)")
         except discord.HTTPException:
             continue
 
@@ -450,8 +449,7 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
     if not matched:
         return
 
-    member = await _get_member(guild, payload.user_id)
-    if member is None or member.bot:
+    if not await _reaction_user_is_human(guild, payload.user_id):
         return
 
     for r in matched:
@@ -463,19 +461,36 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
         if role is None:
             continue
         try:
-            await member.remove_roles(role, reason="Opt-out via reaction (reminder bot)")
+            await _remove_role(guild, payload.user_id, role, "Opt-out via reaction (reminder bot)")
         except discord.HTTPException:
             continue
 
 
-async def _get_member(guild: discord.Guild, user_id: int) -> discord.Member | None:
+async def _reaction_user_is_human(guild: discord.Guild, user_id: int) -> bool:
     member = guild.get_member(user_id)
     if member is not None:
-        return member
+        return not member.bot
     try:
-        return await guild.fetch_member(user_id)
+        user = await bot.fetch_user(user_id)
     except discord.NotFound:
-        return None
+        return False
+    return not user.bot
+
+
+async def _add_role(guild: discord.Guild, user_id: int, role: discord.Role, reason: str) -> None:
+    member = guild.get_member(user_id)
+    if member is not None:
+        await member.add_roles(role, reason=reason)
+    else:
+        await guild._state.http.add_role(guild.id, user_id, role.id, reason=reason)
+
+
+async def _remove_role(guild: discord.Guild, user_id: int, role: discord.Role, reason: str) -> None:
+    member = guild.get_member(user_id)
+    if member is not None:
+        await member.remove_roles(role, reason=reason)
+    else:
+        await guild._state.http.remove_role(guild.id, user_id, role.id, reason=reason)
 
 
 @bot.tree.command(name="ping", description="Health check — replies with Pong!")
