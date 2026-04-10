@@ -349,6 +349,45 @@ async def delete_reminder(interaction: discord.Interaction, reminder_id: str) ->
     await interaction.response.send_message("Deleted that reminder.", ephemeral=True)
 
 
+_REMINDER_HELP = """
+**Reminders — super simple**
+
+The bot does **two** things together:
+1. Someone clicks an emoji on **one special post** → they get a **role** (like a name tag).
+2. **Once a week** the bot writes in a channel and **pings that role** so those people see it.
+
+**You** are the boss of the server, so **only you** can set this up.
+
+**Commands**
+• `/setup-reminder` — opens a little form. Fill the boxes and press Submit.
+• `/list-reminders` — shows everything you set up (copy the long ID if you need it).
+• `/delete-reminder` — type the ID to remove one setup.
+
+**The form boxes (what to type)**
+• **Message ID** — the post people should click. Turn on **Developer Mode** (Settings → Advanced), then **right‑click the message → Copy Message ID**. It’s a long number.
+• **Reaction emoji** — the exact emoji they must click (like a dog). Leave it **empty** if *any* emoji on that post is OK.
+• **Weekly time (UTC)** — when the bot should shout each week. Example: `Friday 00:00` means Friday at midnight **UTC** (not your local clock unless you live in UTC).
+• **Role ID** — the name tag people get. **Right‑click the role → Copy Role ID** (Developer Mode on).
+• **Reminder channel ID** — which **room** the weekly shout goes in. **Right‑click the channel → Copy Channel ID**. Leave **empty** to use the room where you ran the command.
+
+**Important**
+• Put the bot’s role **above** the role it hands out (Server Settings → Roles → drag).
+• The role must be **mentionable** (or you gave the bot permission to ping roles), or people won’t get notified.
+
+**Still stuck?** Run `/ping` to check the bot is awake, then try `/setup-reminder` again.
+""".strip()
+
+
+@bot.tree.command(
+    name="help-reminder",
+    description="Server owner: simple guide for reminder commands (ephemeral)",
+)
+async def help_reminder(interaction: discord.Interaction) -> None:
+    if not await _ensure_guild_owner(interaction):
+        return
+    await interaction.response.send_message(_REMINDER_HELP, ephemeral=True)
+
+
 @bot.event
 async def on_ready() -> None:
     assert bot.user is not None
