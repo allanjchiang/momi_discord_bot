@@ -24,9 +24,19 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise SystemExit("Set DISCORD_TOKEN in .env (see .env.example)")
-# Optional: set to your server ID (Developer Mode → right-click server → Copy Server ID) so
-# slash commands register instantly in that guild. Without it, global sync can take ~1 hour.
+# Optional: comma-separated server IDs so slash commands sync to those guilds immediately.
+# Without it, global sync can take up to ~1 hour to appear everywhere.
 DISCORD_GUILD_ID_RAW = os.getenv("DISCORD_GUILD_ID", "").strip()
+
+
+def _parse_guild_ids(raw: str) -> list[int]:
+    ids: list[int] = []
+    for chunk in raw.split(","):
+        s = chunk.strip()
+        if not s:
+            continue
+        ids.append(int(s))
+    return ids
 
 DATA_PATH = Path(__file__).resolve().parent / "reminders.json"
 _reminder_lock = asyncio.Lock()
@@ -132,33 +142,35 @@ intents = discord.Intents.default()
 class Bot(commands.Bot):
     async def setup_hook(self) -> None:
         try:
-            if DISCORD_GUILD_ID_RAW:
-                guild = discord.Object(id=int(DISCORD_GUILD_ID_RAW))
-                self.tree.copy_global_to(guild=guild)
-                synced = await self.tree.sync(guild=guild)
-                print(
-                    f"Slash commands synced to guild {DISCORD_GUILD_ID_RAW} "
-                    f"({len(synced)}) — they should show right away in that server."
-                )
+            guild_ids = _parse_guild_ids(DISCORD_GUILD_ID_RAW)
+            if guild_ids:
+                for gid in guild_ids:
+                    guild = discord.Object(id=gid)
+                    self.tree.copy_global_to(guild=guild)
+                    synced = await self.tree.sync(guild=guild)
+                    print(
+                        f"Slash commands synced to guild {gid} ({len(synced)}) "
+                        "— should show right away there."
+                    )
             else:
                 synced = await self.tree.sync()
                 print(
                     f"Slash commands synced globally ({len(synced)}). "
                     "New/updated commands may take up to ~1 hour to appear. "
-                    "Set DISCORD_GUILD_ID in .env for instant sync in your server."
+                    "Set DISCORD_GUILD_ID (comma-separated) in .env for instant sync."
                 )
         except discord.HTTPException as e:
             print(f"Slash command sync failed ({e.status}): {e.text}")
             raise
 
 
+bot = Bot(command_prefix="!", intents=intents, help_command=None)
+
+
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: BaseException) -> None:
     cmd = getattr(interaction.command, "name", "?")
     print(f"App command error (/{cmd}): {error!r}")
-
-
-bot = Bot(command_prefix="!", intents=intents, help_command=None)
 
 
 async def _ensure_guild_owner(interaction: discord.Interaction) -> bool:
