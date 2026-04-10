@@ -141,30 +141,55 @@ intents = discord.Intents.default()
 
 class Bot(commands.Bot):
     async def setup_hook(self) -> None:
-        try:
-            guild_ids = _parse_guild_ids(DISCORD_GUILD_ID_RAW)
-            if guild_ids:
-                for gid in guild_ids:
-                    guild = discord.Object(id=gid)
+        guild_ids = _parse_guild_ids(DISCORD_GUILD_ID_RAW)
+        if guild_ids:
+            any_ok = False
+            for gid in guild_ids:
+                guild = discord.Object(id=gid)
+                try:
                     self.tree.copy_global_to(guild=guild)
                     synced = await self.tree.sync(guild=guild)
                     print(
                         f"Slash commands synced to guild {gid} ({len(synced)}) "
                         "— should show right away there."
                     )
-            else:
+                    any_ok = True
+                except discord.Forbidden as e:
+                    if getattr(e, "code", None) == 50001:
+                        print(
+                            f"Slash sync skipped for guild {gid}: Missing Access (50001). "
+                            "The bot is not in that server, or the guild ID is wrong — invite the bot "
+                            "or remove that ID from DISCORD_GUILD_ID."
+                        )
+                    else:
+                        print(f"Slash sync forbidden for guild {gid}: {e}")
+                except discord.HTTPException as e:
+                    print(f"Slash sync failed for guild {gid} ({e.status}): {e.text}")
+
+            if not any_ok:
+                print(
+                    "No guild sync succeeded; falling back to global slash sync "
+                    "(commands can take up to ~1 hour to appear in servers the bot is in)."
+                )
+                try:
+                    synced = await self.tree.sync()
+                    print(f"Global slash sync OK ({len(synced)} commands).")
+                except discord.HTTPException as e:
+                    print(f"Global slash sync also failed ({e.status}): {e.text}")
+        else:
+            try:
                 synced = await self.tree.sync()
                 print(
                     f"Slash commands synced globally ({len(synced)}). "
                     "New/updated commands may take up to ~1 hour to appear. "
                     "Set DISCORD_GUILD_ID (comma-separated) in .env for instant sync."
                 )
-        except discord.HTTPException as e:
-            print(f"Slash command sync failed ({e.status}): {e.text}")
-            raise
+            except discord.HTTPException as e:
+                print(f"Slash command sync failed ({e.status}): {e.text}")
 
 
-bot = Bot(command_prefix="!", intents=intents, help_command=None)
+# when_mentioned avoids the "message content intent" warning; we only use slash commands, not !prefix.
+bot = Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
 
 
 @bot.tree.error
