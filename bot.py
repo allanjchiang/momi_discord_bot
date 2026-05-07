@@ -214,7 +214,9 @@ bot = Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=
 # Temporary in-memory state for guided setup flows (keyed by user+guild).
 # Railway restarts will clear these; that's fine because they're only used during setup.
 # Capture state for guided setup flows (keyed by user+guild).
-# Stored as: {"message_id": int, "mode": str, "role_id": Optional[int], "emojis": set[str]}
+# Stored as:
+# - optin_role_map: {"message_id": int, "mode": "optin_role_map", "role_id": int, "last_emoji": Optional[str]}
+# - reminder_emojis: {"message_id": int, "mode": "reminder_emojis", "emojis": list[str]}
 _optin_capture_state: dict[tuple[int, int], dict[str, Any]] = {}
 
 
@@ -717,9 +719,10 @@ class SetupReminderModal(discord.ui.Modal, title="Set up weekly reminder"):
 
 @bot.tree.command(name="setup-reminder", description="Server owner: add a weekly reaction + role reminder")
 async def setup_reminder(interaction: discord.Interaction) -> None:
-    if not await _ensure_guild_owner(interaction):
+    # Keep the old command name, but make it user-friendly by using the guided wizard.
+    if not await _ensure_guild_manager(interaction):
         return
-    await interaction.response.send_modal(SetupReminderModal())
+    await interaction.response.send_modal(_ReminderSetupModal(requester_id=interaction.user.id))
 
 
 reminder_group = app_commands.Group(name="reminder", description="Configure weekly reminders (easier setup)")
@@ -806,7 +809,7 @@ class _ReminderSetupView(discord.ui.View):
 
         self.selected_role_id: int | None = None
         self.selected_channel_id: int | None = None
-        self.captured_emojis: set[str] = set()
+        self.captured_emojis: list[str] = []
 
         self.role_select = discord.ui.RoleSelect(placeholder="Pick the role to assign + ping", min_values=1, max_values=1)
         self.role_select.callback = self._on_role  # type: ignore[assignment]
@@ -848,7 +851,6 @@ class _ReminderSetupView(discord.ui.View):
         _optin_capture_state[(self.requester_id, self.guild_id)] = {
             "message_id": self.message_id,
             "mode": "reminder_emojis",
-            "role_id": None,
             "emojis": self.captured_emojis,
         }
         await interaction.response.send_message(
@@ -895,7 +897,15 @@ class _ReminderSetupView(discord.ui.View):
 
         emoji_list: list[str | None]
         if self.captured_emojis:
-            emoji_list = list(self.captured_emojis)
+            # Preserve the order the admin reacted in; de-dupe while preserving order.
+            seen: set[str] = set()
+            ordered: list[str] = []
+            for e in self.captured_emojis:
+                if e in seen:
+                    continue
+                seen.add(e)
+                ordered.append(e)
+            emoji_list = ordered
         else:
             emoji_list = [None]
 
@@ -1104,10 +1114,9 @@ class _OptInRolePickerView(discord.ui.View):
         self.guild_id = guild_id
         self.message_id = message_id
         self.selected_role_id: int | None = None
-        self.captured_emojis: set[str] = set()
         # Pending mappings: emoji string -> role_id
         self.emoji_to_role: dict[str, int] = {}
-        self._last_status: str = "Pick a role to start."
+        self._last_status: str = "Pick a role, then click Capture emoji."
 
         self.role_select = discord.ui.RoleSelect(placeholder="Pick a role to map", min_values=1, max_values=1)
         self.role_select.callback = self._on_roles_selected  # type: ignore[assignment]
@@ -1129,8 +1138,8 @@ class _OptInRolePickerView(discord.ui.View):
             return
         values = getattr(self.role_select, "values", [])
         self.selected_role_id = int(values[0].id) if values else None
-        self._last_status = "Role selected. Click **Capture emoji** and react once on the target message."
-        await interaction.response.edit_message(content=self._render(), view=self)
+        # Avoid sending/editing messages here to reduce Discord client scrolling.
+        await interaction.response.defer(ephemeral=True)
 
     @discord.ui.button(label="Capture emoji", style=discord.ButtonStyle.blurple)
     async def capture_emoji(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
@@ -1141,17 +1150,18 @@ class _OptInRolePickerView(discord.ui.View):
             await interaction.response.send_message("This setup is for a different server.", ephemeral=True)
             return
         if self.selected_role_id is None:
-            self._last_status = "Pick a role first (use the dropdown)."
-            await interaction.response.edit_message(content=self._render(), view=self)
+            await interaction.response.send_message("Pick a role first (use the dropdown).", ephemeral=True)
             return
         _optin_capture_state[(self.requester_id, self.guild_id)] = {
             "message_id": self.message_id,
             "mode": "optin_role_map",
-            "role_id": self.selected_role_id,
-            "emojis": self.captured_emojis,
+            "role_id": int(self.selected_role_id),
+            "last_emoji": None,
         }
-        self._last_status = "Emoji capture ON. React once on the message, then click **Add mapping**."
-        await interaction.response.edit_message(content=self._render(), view=self)
+        await interaction.response.send_message(
+            "Emoji capture is ON. React once on the target message with the emoji for this role, then click **Add mapping**.",
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="Add mapping", style=discord.ButtonStyle.green)
     async def add_mapping(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
@@ -1162,19 +1172,23 @@ class _OptInRolePickerView(discord.ui.View):
             await interaction.response.send_message("This setup is for a different server.", ephemeral=True)
             return
         if self.selected_role_id is None:
-            self._last_status = "Pick a role first (use the dropdown)."
-            await interaction.response.edit_message(content=self._render(), view=self)
+            await interaction.response.send_message("Pick a role first (use the dropdown).", ephemeral=True)
             return
-        if not self.captured_emojis:
-            self._last_status = "No emoji captured yet. Click **Capture emoji** and react once."
-            await interaction.response.edit_message(content=self._render(), view=self)
+        state = _optin_capture_state.get((self.requester_id, self.guild_id))
+        if not isinstance(state, dict) or str(state.get("mode") or "") != "optin_role_map":
+            await interaction.response.send_message("Click **Capture emoji** first.", ephemeral=True)
+            return
+        if int(state.get("message_id", 0)) != self.message_id or int(state.get("role_id", 0)) != int(self.selected_role_id):
+            await interaction.response.send_message("Click **Capture emoji** again for the currently selected role.", ephemeral=True)
+            return
+        emoji = state.get("last_emoji")
+        if not isinstance(emoji, str) or not emoji:
+            await interaction.response.send_message("No emoji captured yet. React once, then try again.", ephemeral=True)
             return
 
-        # Use the most recently captured emoji for the current role.
-        captured = list(self.captured_emojis)
-        emoji = captured[-1]
-        self.emoji_to_role[emoji] = self.selected_role_id
-        self._last_status = f"Mapped {emoji} → <@&{self.selected_role_id}>. Pick another role to continue."
+        self.emoji_to_role[emoji] = int(self.selected_role_id)
+        # Clear capture so the next mapping requires an explicit capture click.
+        _optin_capture_state.pop((self.requester_id, self.guild_id), None)
         await interaction.response.edit_message(content=self._render(), view=self)
 
     @discord.ui.button(label="Finish", style=discord.ButtonStyle.green)
@@ -1560,9 +1574,13 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     state = _optin_capture_state.get((payload.user_id, payload.guild_id))
     if isinstance(state, dict) and int(state.get("message_id", 0)) == payload.message_id:
         mode = str(state.get("mode") or "")
-        emojis = state.get("emojis")
-        if isinstance(emojis, set):
-            emojis.add(str(payload.emoji))
+        if mode == "optin_role_map":
+            # Capture the single emoji for the currently selected role mapping.
+            state["last_emoji"] = str(payload.emoji)
+        else:
+            emojis = state.get("emojis")
+            if isinstance(emojis, list):
+                emojis.append(str(payload.emoji))
         # For reminder emoji capture, we don't want to stop normal processing; but for opt-in mapping
         # we also don't want to auto-assign roles while the admin is configuring. So:
         if mode in {"reminder_emojis", "optin_role_map"}:
