@@ -64,7 +64,7 @@ _WEEKDAY_ALIASES: dict[str, int] = {
 
 
 def _default_data() -> dict[str, Any]:
-    return {"reminders": [], "welcome": {}}
+    return {"reminders": [], "welcome": {}, "opt_in_roles": []}
 
 
 async def _load_reminders() -> dict[str, Any]:
@@ -83,6 +83,9 @@ async def _load_reminders() -> dict[str, Any]:
         welcome = data.get("welcome")
         if not isinstance(welcome, dict):
             data["welcome"] = {}
+        opt_in = data.get("opt_in_roles")
+        if not isinstance(opt_in, list):
+            data["opt_in_roles"] = []
         return data
 
     return await asyncio.to_thread(_read)
@@ -137,6 +140,19 @@ def _emoji_matches_rule(stored: str | None, emoji: discord.PartialEmoji) -> bool
     if stored is None or stored == "":
         return True
     return str(emoji) == stored
+
+
+def _guild_opt_in_roles(data: dict[str, Any], guild_id: int) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    rows = data.get("opt_in_roles")
+    if not isinstance(rows, list):
+        return out
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if int(r.get("guild_id", 0)) == guild_id:
+            out.append(r)
+    return out
 
 
 intents = discord.Intents.default()
@@ -791,6 +807,124 @@ async def reminder_add(
 bot.tree.add_command(reminder_group)
 
 
+optin_group = app_commands.Group(name="optin", description="Opt-in roles via reacting to a message")
+
+
+@optin_group.command(name="add", description="Owner/admin: create opt-in role(s) for emoji reactions")
+@app_commands.describe(
+    message_link="Copy Message Link from the target message",
+    role="Role to add/remove when users react/unreact",
+    emojis="Comma-separated emojis (blank = any emoji)",
+)
+async def optin_add(
+    interaction: discord.Interaction,
+    message_link: str,
+    role: discord.Role,
+    emojis: str | None = None,
+) -> None:
+    if not await _ensure_guild_manager(interaction):
+        return
+    assert interaction.guild is not None
+
+    try:
+        link_guild_id, _link_channel_id, mid = _parse_message_link(message_link)
+    except ValueError as e:
+        await _send_ephemeral(interaction, str(e))
+        return
+    if link_guild_id != interaction.guild.id:
+        await _send_ephemeral(interaction, "That message link is from a different server.")
+        return
+
+    bot_member = interaction.guild.me
+    if bot_member is None:
+        await _send_ephemeral(interaction, "Bot member not available.")
+        return
+    if role >= bot_member.top_role and interaction.guild.owner_id != bot_member.id:
+        await _send_ephemeral(interaction, "Move the bot's role **above** the target role in Server Settings → Roles.")
+        return
+
+    emoji_list = _parse_emoji_list(emojis)
+    created_ids: list[str] = []
+    async with _reminder_lock:
+        data = await _load_reminders()
+        rows = data.get("opt_in_roles")
+        if not isinstance(rows, list):
+            rows = []
+            data["opt_in_roles"] = rows
+        for e in emoji_list:
+            oid = str(uuid.uuid4())
+            rows.append(
+                {
+                    "id": oid,
+                    "guild_id": interaction.guild.id,
+                    "message_id": mid,
+                    "emoji": e,
+                    "role_id": role.id,
+                }
+            )
+            created_ids.append(oid)
+        await _save_reminders(data)
+
+    emoji_desc = "any emoji" if emoji_list == [None] else ", ".join([str(x) for x in emoji_list if x])
+    await _send_ephemeral(
+        interaction,
+        "Saved opt-in role rule(s).\n"
+        f"- Message: `{mid}` (from link)\n"
+        f"- Emojis: {emoji_desc}\n"
+        f"- Role: {role.mention}\n"
+        f"- IDs: {', '.join([cid[:8] + '…' for cid in created_ids])}",
+    )
+
+
+@optin_group.command(name="list", description="Owner/admin: list opt-in role rules in this server")
+async def optin_list(interaction: discord.Interaction) -> None:
+    if not await _ensure_guild_manager(interaction):
+        return
+    assert interaction.guild is not None
+    data = await _load_reminders()
+    rows = _guild_opt_in_roles(data, interaction.guild.id)
+    if not rows:
+        await _send_ephemeral(interaction, "No opt-in roles configured. Use `/optin add`.")
+        return
+    lines: list[str] = []
+    for r in rows[:50]:
+        emoji_s = r.get("emoji") or "(any)"
+        lines.append(
+            f"**`{r.get('id','')}`** — msg `{r.get('message_id')}` / {emoji_s} / role `{r.get('role_id')}`"
+        )
+    await _send_ephemeral(interaction, "\n".join(lines)[:4000])
+
+
+@optin_group.command(name="delete", description="Owner/admin: delete one opt-in role rule by ID")
+@app_commands.describe(rule_id="Full ID from /optin list")
+async def optin_delete(interaction: discord.Interaction, rule_id: str) -> None:
+    if not await _ensure_guild_manager(interaction):
+        return
+    assert interaction.guild is not None
+    rid = rule_id.strip()
+    async with _reminder_lock:
+        data = await _load_reminders()
+        rows = data.get("opt_in_roles")
+        if not isinstance(rows, list):
+            rows = []
+            data["opt_in_roles"] = rows
+        before = len(rows)
+        rows = [
+            r
+            for r in rows
+            if not (isinstance(r, dict) and r.get("id") == rid and int(r.get("guild_id", 0)) == interaction.guild.id)
+        ]
+        data["opt_in_roles"] = rows
+        if len(rows) == before:
+            await _send_ephemeral(interaction, "No opt-in rule with that ID in this server.")
+            return
+        await _save_reminders(data)
+    await _send_ephemeral(interaction, "Deleted that opt-in rule.")
+
+
+bot.tree.add_command(optin_group)
+
+
 @bot.tree.command(name="list-reminders", description="Server owner: list configured reminders in this server")
 async def list_reminders(interaction: discord.Interaction) -> None:
     if not await _ensure_guild_owner(interaction):
@@ -985,7 +1119,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
 
     data = await _load_reminders()
     matched: list[dict[str, Any]] = []
-    for r in data["reminders"]:
+    for r in list(data.get("reminders") or []) + list(data.get("opt_in_roles") or []):
         if not isinstance(r, dict):
             continue
         if int(r.get("guild_id", 0)) != guild.id:
@@ -1029,7 +1163,7 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
 
     data = await _load_reminders()
     matched: list[dict[str, Any]] = []
-    for r in data["reminders"]:
+    for r in list(data.get("reminders") or []) + list(data.get("opt_in_roles") or []):
         if not isinstance(r, dict):
             continue
         if int(r.get("guild_id", 0)) != guild.id:
