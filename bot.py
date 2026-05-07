@@ -304,17 +304,14 @@ def _get_welcome_config(data: dict[str, Any], guild_id: int) -> dict[str, Any] |
 
 class SetupWelcomeModal(discord.ui.Modal, title="Set up welcome message"):
     welcome_channel = discord.ui.TextInput(
-        label="Welcome channel (type #channel, mention, or ID)",
-        placeholder="Examples: #welcome   <#123456789>   123456789   (leave blank = system/default)",
+        label="Welcome channel",
+        placeholder="#welcome or <#123> or 123 (blank=default)",
         max_length=100,
         required=False,
     )
     welcome_message = discord.ui.TextInput(
         label="Welcome message",
-        placeholder=(
-            "Example: Welcome {user_mention} to {server_name}!\n"
-            "Placeholders: {user_mention} {user_name} {server_name}"
-        ),
+        placeholder="Welcome {user_mention} to {server_name}! ({user_name} supported)",
         style=discord.TextStyle.paragraph,
         max_length=1000,
     )
