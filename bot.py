@@ -199,6 +199,19 @@ bot = Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=
 async def on_app_command_error(interaction: discord.Interaction, error: BaseException) -> None:
     cmd = getattr(interaction.command, "name", "?")
     print(f"App command error (/{cmd}): {error!r}")
+    # Avoid "Application did not respond" by replying gracefully when possible.
+    try:
+        msg = (
+            "Sorry — that command errored.\n"
+            "If you're setting up welcomes, double-check the bot has permission to send messages "
+            "in the target channel, then try again."
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        pass
 
 
 async def _ensure_guild_owner(interaction: discord.Interaction) -> bool:
@@ -210,6 +223,26 @@ async def _ensure_guild_owner(interaction: discord.Interaction) -> bool:
         await interaction.response.send_message("Only the **server owner** can use this command.", ephemeral=True)
         return False
     return True
+
+
+async def _ensure_guild_manager(interaction: discord.Interaction) -> bool:
+    """Allow server owner or admins to configure per-guild settings."""
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("Use this command in a server.", ephemeral=True)
+        return False
+    if interaction.user.id == guild.owner_id:
+        return True
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if member is not None:
+        perms = member.guild_permissions
+        if perms.administrator or perms.manage_guild:
+            return True
+    await interaction.response.send_message(
+        "You need **Manage Server** (or be the server owner) to configure welcome messages.",
+        ephemeral=True,
+    )
+    return False
 
 
 def _render_welcome_template(template: str, member: discord.Member) -> str:
@@ -245,10 +278,30 @@ class SetupWelcomeModal(discord.ui.Modal, title="Set up welcome message"):
         max_length=1000,
     )
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        print(f"Welcome modal error: {error!r}")
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "Sorry — saving welcome settings failed. Please try again.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "Sorry — saving welcome settings failed. Please try again.",
+                    ephemeral=True,
+                )
+        except discord.HTTPException:
+            pass
+
     async def on_submit(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
         if interaction.user.id != interaction.guild.owner_id:
-            await interaction.response.send_message("Only the **server owner** can submit this form.", ephemeral=True)
+            await interaction.response.send_message(
+                "Only the **server owner** can submit this form. "
+                "(Tip: use `/welcome set` if you want to allow admins too.)",
+                ephemeral=True,
+            )
             return
 
         raw_cid = str(self.welcome_channel_id.value or "").strip()
@@ -278,7 +331,8 @@ class SetupWelcomeModal(discord.ui.Modal, title="Set up welcome message"):
             await _save_reminders(data)
 
         ch_desc = f"<#{channel_id}>" if channel_id else "(no channel set)"
-        preview = _render_welcome_template(template, interaction.user)  # type: ignore[arg-type]
+        preview_user = interaction.user if isinstance(interaction.user, discord.Member) else None
+        preview = _render_welcome_template(template, preview_user) if preview_user else template
         await interaction.response.send_message(
             "Saved welcome settings.\n"
             f"- Channel: {ch_desc}\n"
@@ -292,6 +346,118 @@ async def setup_welcome(interaction: discord.Interaction) -> None:
     if not await _ensure_guild_owner(interaction):
         return
     await interaction.response.send_modal(SetupWelcomeModal())
+
+
+welcome_group = app_commands.Group(name="welcome", description="Configure welcome messages for new members")
+
+
+@welcome_group.command(name="set", description="Owner/admin: set the welcome channel and message template")
+@app_commands.describe(
+    channel="Channel to post welcome messages in (omit to use system/default channel)",
+    message="Template supports {user_mention}, {user_name}, {server_name}",
+)
+async def welcome_set(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+    message: str | None = None,
+) -> None:
+    if not await _ensure_guild_manager(interaction):
+        return
+    assert interaction.guild is not None
+
+    async with _reminder_lock:
+        data = await _load_reminders()
+        welcome = data.get("welcome")
+        if not isinstance(welcome, dict):
+            welcome = {}
+            data["welcome"] = welcome
+        cfg = welcome.get(str(interaction.guild.id))
+        if not isinstance(cfg, dict):
+            cfg = {"enabled": True, "channel_id": None, "template": "Welcome {user_mention} to {server_name}!"}
+
+        if channel is not None:
+            cfg["channel_id"] = channel.id
+        if message is not None:
+            m = message.strip()
+            if not m:
+                await interaction.response.send_message("Message cannot be empty.", ephemeral=True)
+                return
+            cfg["template"] = m
+        cfg["enabled"] = True
+        welcome[str(interaction.guild.id)] = cfg
+        await _save_reminders(data)
+
+    ch_id = cfg.get("channel_id")
+    ch_desc = f"<#{int(ch_id)}>" if isinstance(ch_id, int) else "(system/default channel)"
+    await interaction.response.send_message(
+        "Welcome messages enabled and saved.\n"
+        f"- Channel: {ch_desc}\n"
+        f"- Template: {cfg.get('template')}\n"
+        "Tip: run `/welcome test` to preview.",
+        ephemeral=True,
+    )
+
+
+@welcome_group.command(name="disable", description="Owner/admin: disable welcome messages for this server")
+async def welcome_disable(interaction: discord.Interaction) -> None:
+    if not await _ensure_guild_manager(interaction):
+        return
+    assert interaction.guild is not None
+    async with _reminder_lock:
+        data = await _load_reminders()
+        welcome = data.get("welcome")
+        if not isinstance(welcome, dict):
+            welcome = {}
+            data["welcome"] = welcome
+        cfg = welcome.get(str(interaction.guild.id))
+        if not isinstance(cfg, dict):
+            cfg = {"enabled": False, "channel_id": None, "template": ""}
+        cfg["enabled"] = False
+        welcome[str(interaction.guild.id)] = cfg
+        await _save_reminders(data)
+    await interaction.response.send_message("Welcome messages disabled for this server.", ephemeral=True)
+
+
+@welcome_group.command(name="show", description="Owner/admin: show current welcome settings")
+async def welcome_show(interaction: discord.Interaction) -> None:
+    if not await _ensure_guild_manager(interaction):
+        return
+    assert interaction.guild is not None
+    data = await _load_reminders()
+    cfg = _get_welcome_config(data, interaction.guild.id)
+    if not cfg:
+        await interaction.response.send_message("No welcome settings saved yet. Use `/welcome set`.", ephemeral=True)
+        return
+    enabled = bool(cfg.get("enabled", True))
+    ch_id = cfg.get("channel_id")
+    ch_desc = f"<#{int(ch_id)}>" if isinstance(ch_id, int) else "(system/default channel)"
+    template = str(cfg.get("template") or "").strip() or "(empty)"
+    await interaction.response.send_message(
+        f"Welcome settings:\n- Enabled: **{enabled}**\n- Channel: {ch_desc}\n- Template: {template}",
+        ephemeral=True,
+    )
+
+
+@welcome_group.command(name="test", description="Owner/admin: preview the welcome message (ephemeral)")
+async def welcome_test(interaction: discord.Interaction) -> None:
+    if not await _ensure_guild_manager(interaction):
+        return
+    assert interaction.guild is not None
+    data = await _load_reminders()
+    cfg = _get_welcome_config(data, interaction.guild.id)
+    if not cfg or not cfg.get("enabled", True):
+        await interaction.response.send_message("Welcome messages are not enabled. Use `/welcome set`.", ephemeral=True)
+        return
+    template = str(cfg.get("template") or "").strip()
+    if not template:
+        await interaction.response.send_message("Welcome template is empty. Use `/welcome set`.", ephemeral=True)
+        return
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    preview = _render_welcome_template(template, member) if member else template
+    await interaction.response.send_message(f"Preview:\n{preview}", ephemeral=True)
+
+
+bot.tree.add_command(welcome_group)
 
 
 @bot.tree.command(name="disable-welcome", description="Server owner: disable welcome message for new members")
@@ -327,7 +493,8 @@ async def test_welcome(interaction: discord.Interaction) -> None:
     if not template:
         await interaction.response.send_message("Welcome template is missing. Re-run `/setup-welcome`.", ephemeral=True)
         return
-    msg = _render_welcome_template(template, interaction.user)  # type: ignore[arg-type]
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    msg = _render_welcome_template(template, member) if member else template
     await interaction.response.send_message(f"Test welcome message:\n{msg}", ephemeral=True)
 
 
