@@ -214,13 +214,24 @@ async def on_app_command_error(interaction: discord.Interaction, error: BaseExce
         pass
 
 
+async def _send_ephemeral(interaction: discord.Interaction, message: str) -> None:
+    """Send an ephemeral message whether or not we've already responded."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
 async def _ensure_guild_owner(interaction: discord.Interaction) -> bool:
     guild = interaction.guild
     if guild is None:
-        await interaction.response.send_message("Use this command in a server.", ephemeral=True)
+        await _send_ephemeral(interaction, "Use this command in a server.")
         return False
     if interaction.user.id != guild.owner_id:
-        await interaction.response.send_message("Only the **server owner** can use this command.", ephemeral=True)
+        await _send_ephemeral(interaction, "Only the **server owner** can use this command.")
         return False
     return True
 
@@ -229,7 +240,7 @@ async def _ensure_guild_manager(interaction: discord.Interaction) -> bool:
     """Allow server owner or admins to configure per-guild settings."""
     guild = interaction.guild
     if guild is None:
-        await interaction.response.send_message("Use this command in a server.", ephemeral=True)
+        await _send_ephemeral(interaction, "Use this command in a server.")
         return False
     if interaction.user.id == guild.owner_id:
         return True
@@ -238,9 +249,9 @@ async def _ensure_guild_manager(interaction: discord.Interaction) -> bool:
         perms = member.guild_permissions
         if perms.administrator or perms.manage_guild:
             return True
-    await interaction.response.send_message(
+    await _send_ephemeral(
+        interaction,
         "You need **Manage Server** (or be the server owner) to configure welcome messages.",
-        ephemeral=True,
     )
     return False
 
@@ -344,7 +355,7 @@ class SetupWelcomeModal(discord.ui.Modal, title="Set up welcome message"):
 
         template = str(self.welcome_message.value or "").strip()
         if not template:
-            await interaction.followup.send("Welcome message cannot be empty.", ephemeral=True)
+            await _send_ephemeral(interaction, "Welcome message cannot be empty.")
             return
 
         cfg: dict[str, Any] = {"enabled": True, "channel_id": channel_id, "template": template}
@@ -371,9 +382,13 @@ class SetupWelcomeModal(discord.ui.Modal, title="Set up welcome message"):
 
 @bot.tree.command(name="setup-welcome", description="Server owner: configure welcome message for new members")
 async def setup_welcome(interaction: discord.Interaction) -> None:
-    if not await _ensure_guild_owner(interaction):
+    # Keep this command name for discoverability, but allow admins too.
+    if not await _ensure_guild_manager(interaction):
         return
-    await interaction.response.send_modal(SetupWelcomeModal())
+    try:
+        await interaction.response.send_modal(SetupWelcomeModal())
+    except discord.HTTPException:
+        await _send_ephemeral(interaction, "Sorry — I couldn't open the welcome setup popup. Please try again.")
 
 
 welcome_group = app_commands.Group(name="welcome", description="Configure welcome messages for new members")
