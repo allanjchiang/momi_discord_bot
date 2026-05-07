@@ -63,7 +63,7 @@ _WEEKDAY_ALIASES: dict[str, int] = {
 
 
 def _default_data() -> dict[str, Any]:
-    return {"reminders": []}
+    return {"reminders": [], "welcome": {}}
 
 
 async def _load_reminders() -> dict[str, Any]:
@@ -79,6 +79,9 @@ async def _load_reminders() -> dict[str, Any]:
             return _default_data()
         if not isinstance(data["reminders"], list):
             data["reminders"] = []
+        welcome = data.get("welcome")
+        if not isinstance(welcome, dict):
+            data["welcome"] = {}
         return data
 
     return await asyncio.to_thread(_read)
@@ -136,8 +139,8 @@ def _emoji_matches_rule(stored: str | None, emoji: discord.PartialEmoji) -> bool
 
 
 intents = discord.Intents.default()
-# Server Members Intent is not required: role changes use REST when the member
-# isn't cached. Enable it in the Developer Portal only if you add features that need member lists.
+# Needed for welcome messages via on_member_join (enable "Server Members Intent" in the Developer Portal too).
+intents.members = True
 
 class Bot(commands.Bot):
     async def setup_hook(self) -> None:
@@ -207,6 +210,125 @@ async def _ensure_guild_owner(interaction: discord.Interaction) -> bool:
         await interaction.response.send_message("Only the **server owner** can use this command.", ephemeral=True)
         return False
     return True
+
+
+def _render_welcome_template(template: str, member: discord.Member) -> str:
+    guild = member.guild
+    return (
+        template.replace("{user_mention}", member.mention)
+        .replace("{user_name}", member.display_name)
+        .replace("{server_name}", guild.name)
+    )
+
+
+def _get_welcome_config(data: dict[str, Any], guild_id: int) -> dict[str, Any] | None:
+    welcome = data.get("welcome")
+    if not isinstance(welcome, dict):
+        return None
+    cfg = welcome.get(str(guild_id))
+    if not isinstance(cfg, dict):
+        return None
+    return cfg
+
+
+class SetupWelcomeModal(discord.ui.Modal, title="Set up welcome message"):
+    welcome_channel_id = discord.ui.TextInput(
+        label="Welcome channel ID (blank = system/default channel)",
+        placeholder="Right-click channel → Copy Channel ID",
+        max_length=22,
+        required=False,
+    )
+    welcome_message = discord.ui.TextInput(
+        label="Welcome message",
+        placeholder="Example: Welcome {user_mention} to {server_name}!",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild is not None
+        if interaction.user.id != interaction.guild.owner_id:
+            await interaction.response.send_message("Only the **server owner** can submit this form.", ephemeral=True)
+            return
+
+        raw_cid = str(self.welcome_channel_id.value or "").strip()
+        channel_id: int | None
+        if raw_cid:
+            try:
+                channel_id = int(raw_cid)
+            except ValueError:
+                await interaction.response.send_message("Welcome channel ID must be a number.", ephemeral=True)
+                return
+        else:
+            channel_id = interaction.guild.system_channel.id if interaction.guild.system_channel else None
+
+        template = str(self.welcome_message.value or "").strip()
+        if not template:
+            await interaction.response.send_message("Welcome message cannot be empty.", ephemeral=True)
+            return
+
+        cfg: dict[str, Any] = {"enabled": True, "channel_id": channel_id, "template": template}
+        async with _reminder_lock:
+            data = await _load_reminders()
+            welcome = data.get("welcome")
+            if not isinstance(welcome, dict):
+                welcome = {}
+                data["welcome"] = welcome
+            welcome[str(interaction.guild.id)] = cfg
+            await _save_reminders(data)
+
+        ch_desc = f"<#{channel_id}>" if channel_id else "(no channel set)"
+        preview = _render_welcome_template(template, interaction.user)  # type: ignore[arg-type]
+        await interaction.response.send_message(
+            "Saved welcome settings.\n"
+            f"- Channel: {ch_desc}\n"
+            f"- Template preview: {preview}",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="setup-welcome", description="Server owner: configure welcome message for new members")
+async def setup_welcome(interaction: discord.Interaction) -> None:
+    if not await _ensure_guild_owner(interaction):
+        return
+    await interaction.response.send_modal(SetupWelcomeModal())
+
+
+@bot.tree.command(name="disable-welcome", description="Server owner: disable welcome message for new members")
+async def disable_welcome(interaction: discord.Interaction) -> None:
+    if not await _ensure_guild_owner(interaction):
+        return
+    assert interaction.guild is not None
+    async with _reminder_lock:
+        data = await _load_reminders()
+        welcome = data.get("welcome")
+        if not isinstance(welcome, dict):
+            welcome = {}
+            data["welcome"] = welcome
+        cfg = welcome.get(str(interaction.guild.id))
+        if isinstance(cfg, dict):
+            cfg["enabled"] = False
+            welcome[str(interaction.guild.id)] = cfg
+        await _save_reminders(data)
+    await interaction.response.send_message("Welcome messages disabled for this server.", ephemeral=True)
+
+
+@bot.tree.command(name="test-welcome", description="Server owner: send a test welcome message (to you)")
+async def test_welcome(interaction: discord.Interaction) -> None:
+    if not await _ensure_guild_owner(interaction):
+        return
+    assert interaction.guild is not None
+    data = await _load_reminders()
+    cfg = _get_welcome_config(data, interaction.guild.id)
+    if not cfg or not cfg.get("enabled", True):
+        await interaction.response.send_message("Welcome messages are not enabled. Use `/setup-welcome`.", ephemeral=True)
+        return
+    template = str(cfg.get("template") or "").strip()
+    if not template:
+        await interaction.response.send_message("Welcome template is missing. Re-run `/setup-welcome`.", ephemeral=True)
+        return
+    msg = _render_welcome_template(template, interaction.user)  # type: ignore[arg-type]
+    await interaction.response.send_message(f"Test welcome message:\n{msg}", ephemeral=True)
 
 
 class SetupReminderModal(discord.ui.Modal, title="Set up weekly reminder"):
@@ -419,6 +541,35 @@ async def on_ready() -> None:
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     if not reminder_tick.is_running():
         reminder_tick.start()
+
+
+@bot.event
+async def on_member_join(member: discord.Member) -> None:
+    data = await _load_reminders()
+    cfg = _get_welcome_config(data, member.guild.id)
+    if not cfg or not cfg.get("enabled", True):
+        return
+    template = str(cfg.get("template") or "").strip()
+    if not template:
+        return
+
+    channel: discord.abc.Messageable | None = None
+    channel_id = cfg.get("channel_id")
+    if isinstance(channel_id, int):
+        ch = member.guild.get_channel(channel_id)
+        if isinstance(ch, discord.abc.Messageable):
+            channel = ch
+    if channel is None:
+        sys_ch = member.guild.system_channel
+        if isinstance(sys_ch, discord.abc.Messageable):
+            channel = sys_ch
+    if channel is None:
+        return
+
+    try:
+        await channel.send(_render_welcome_template(template, member))
+    except discord.HTTPException:
+        return
 
 
 @tasks.loop(minutes=1)
