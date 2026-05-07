@@ -10,6 +10,7 @@ import asyncio
 import datetime as dt
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -300,6 +301,36 @@ def _get_welcome_config(data: dict[str, Any], guild_id: int) -> dict[str, Any] |
     if not isinstance(cfg, dict):
         return None
     return cfg
+
+
+_MSG_LINK_RE = re.compile(r"discord\.com/channels/(\d+)/(\d+)/(\d+)")
+
+
+def _parse_message_link(raw: str) -> tuple[int, int, int]:
+    """
+    Parse a Discord message link: https://discord.com/channels/<guild>/<channel>/<message>
+    Returns (guild_id, channel_id, message_id).
+    """
+    s = raw.strip().strip("<>").strip()
+    m = _MSG_LINK_RE.search(s)
+    if not m:
+        raise ValueError("Paste a full Discord message link like https://discord.com/channels/<guild>/<channel>/<message>")
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def _parse_emoji_list(raw: str | None) -> list[str | None]:
+    """
+    Parse comma-separated emojis. Blank/None means 'any emoji' (single entry None).
+    Examples: "🐕, 🐈" or "<:name:123>, ✅"
+    """
+    if raw is None:
+        return [None]
+    s = raw.strip()
+    if not s:
+        return [None]
+    parts = [p.strip() for p in s.split(",")]
+    out: list[str] = [p for p in parts if p]
+    return out or [None]
 
 
 class SetupWelcomeModal(discord.ui.Modal, title="Set up welcome message"):
@@ -664,6 +695,102 @@ async def setup_reminder(interaction: discord.Interaction) -> None:
     await interaction.response.send_modal(SetupReminderModal())
 
 
+reminder_group = app_commands.Group(name="reminder", description="Configure weekly reminders (easier setup)")
+
+
+@reminder_group.command(name="add", description="Owner/admin: add a weekly reminder (supports multiple emojis)")
+@app_commands.describe(
+    message_link="Copy Message Link from the target message",
+    emojis="Comma-separated emojis (blank = any emoji)",
+    schedule_utc="Example: Friday 00:00 (UTC)",
+    role="Role to assign on reaction and ping weekly",
+    channel="Channel to send weekly pings in (omit = use current channel)",
+)
+async def reminder_add(
+    interaction: discord.Interaction,
+    message_link: str,
+    schedule_utc: str,
+    role: discord.Role,
+    emojis: str | None = None,
+    channel: discord.TextChannel | None = None,
+) -> None:
+    if not await _ensure_guild_manager(interaction):
+        return
+    assert interaction.guild is not None
+
+    try:
+        link_guild_id, link_channel_id, mid = _parse_message_link(message_link)
+    except ValueError as e:
+        await _send_ephemeral(interaction, str(e))
+        return
+    if link_guild_id != interaction.guild.id:
+        await _send_ephemeral(interaction, "That message link is from a different server.")
+        return
+
+    try:
+        weekday, hour, minute = _parse_schedule(schedule_utc)
+    except ValueError as e:
+        await _send_ephemeral(interaction, str(e))
+        return
+
+    target_channel: discord.abc.Messageable | None = channel
+    if target_channel is None:
+        ch_id = interaction.channel_id
+        if ch_id is not None:
+            ch = interaction.guild.get_channel(ch_id)
+            if isinstance(ch, discord.abc.Messageable):
+                target_channel = ch
+    if target_channel is None:
+        await _send_ephemeral(interaction, "Could not determine which channel to post weekly pings in.")
+        return
+
+    bot_member = interaction.guild.me
+    if bot_member is None:
+        await _send_ephemeral(interaction, "Bot member not available.")
+        return
+    if role >= bot_member.top_role and interaction.guild.owner_id != bot_member.id:
+        await _send_ephemeral(interaction, "Move the bot's role **above** the target role in Server Settings → Roles.")
+        return
+
+    emoji_list = _parse_emoji_list(emojis)
+    created_ids: list[str] = []
+    async with _reminder_lock:
+        data = await _load_reminders()
+        for e in emoji_list:
+            rid_str = str(uuid.uuid4())
+            row = {
+                "id": rid_str,
+                "guild_id": interaction.guild.id,
+                "message_id": mid,
+                "emoji": e,
+                "weekday": weekday,
+                "hour": hour,
+                "minute": minute,
+                "role_id": role.id,
+                "channel_id": getattr(target_channel, "id", interaction.channel_id),
+                "last_fired_slot": None,
+            }
+            data["reminders"].append(row)
+            created_ids.append(rid_str)
+        await _save_reminders(data)
+
+    wd_name = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][weekday]
+    emoji_desc = "any emoji" if emoji_list == [None] else ", ".join([str(x) for x in emoji_list if x])
+    await _send_ephemeral(
+        interaction,
+        "Saved reminder(s).\n"
+        f"- Message: `{mid}` (from link)\n"
+        f"- Emojis: {emoji_desc}\n"
+        f"- Weekly: **{wd_name}** at **{hour:02d}:{minute:02d} UTC**\n"
+        f"- Role: {role.mention}\n"
+        f"- Ping channel: {getattr(target_channel, 'mention', '(selected)')}\n"
+        f"- IDs: {', '.join([cid[:8] + '…' for cid in created_ids])}",
+    )
+
+
+bot.tree.add_command(reminder_group)
+
+
 @bot.tree.command(name="list-reminders", description="Server owner: list configured reminders in this server")
 async def list_reminders(interaction: discord.Interaction) -> None:
     if not await _ensure_guild_owner(interaction):
@@ -720,7 +847,8 @@ The bot does **two** things together:
 **You** are the boss of the server, so **only you** can set this up.
 
 **Commands**
-• `/setup-reminder` — opens a little form. Fill the boxes and press Submit.
+• `/reminder add` — easiest setup (message link + pick role/channel + optional multiple emojis).
+• `/setup-reminder` — legacy setup form (IDs). Still works.
 • `/list-reminders` — shows everything you set up (copy the long ID if you need it).
 • `/delete-reminder` — type the ID to remove one setup.
 
