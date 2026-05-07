@@ -880,16 +880,15 @@ class _OptInRolePickerView(discord.ui.View):
         # Pending mappings: emoji string -> role_id
         self.emoji_to_role: dict[str, int] = {}
 
-        role_select = discord.ui.RoleSelect(placeholder="Pick a role to map", min_values=1, max_values=1)
-        role_select.callback = self._on_roles_selected  # type: ignore[assignment]
-        self.add_item(role_select)
+        self.role_select = discord.ui.RoleSelect(placeholder="Pick a role to map", min_values=1, max_values=1)
+        self.role_select.callback = self._on_roles_selected  # type: ignore[assignment]
+        self.add_item(self.role_select)
 
     async def _on_roles_selected(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.requester_id:
             await interaction.response.send_message("Only the person who started setup can change this.", ephemeral=True)
             return
-        item = self.children[0]
-        values = getattr(item, "values", [])
+        values = getattr(self.role_select, "values", [])
         self.selected_role_id = int(values[0].id) if values else None
         await interaction.response.send_message(
             "Role selected. Click **Capture emoji** to record the emoji for this role.",
