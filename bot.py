@@ -254,6 +254,33 @@ def _render_welcome_template(template: str, member: discord.Member) -> str:
     )
 
 
+def _parse_channel_reference(guild: discord.Guild, raw: str) -> int | None:
+    """
+    Parse a typed channel reference.
+    Accepts: blank, "system", a raw ID, or a channel mention like <#123>.
+    Returns channel_id or None (meaning "use system/default channel").
+    """
+    s = raw.strip()
+    if not s:
+        return None
+    low = s.lower()
+    if low in {"system", "default"}:
+        return None
+    if s.startswith("<#") and s.endswith(">"):
+        inner = s[2:-1].strip()
+        if inner.isdigit():
+            return int(inner)
+    if s.isdigit():
+        return int(s)
+    # As a convenience, allow "#general" style names (first match wins).
+    if s.startswith("#"):
+        name = s[1:].strip().lower()
+        for ch in guild.text_channels:
+            if ch.name.lower() == name:
+                return ch.id
+    return None
+
+
 def _get_welcome_config(data: dict[str, Any], guild_id: int) -> dict[str, Any] | None:
     welcome = data.get("welcome")
     if not isinstance(welcome, dict):
@@ -265,15 +292,18 @@ def _get_welcome_config(data: dict[str, Any], guild_id: int) -> dict[str, Any] |
 
 
 class SetupWelcomeModal(discord.ui.Modal, title="Set up welcome message"):
-    welcome_channel_id = discord.ui.TextInput(
-        label="Welcome channel ID (blank = system/default channel)",
-        placeholder="Right-click channel → Copy Channel ID",
-        max_length=22,
+    welcome_channel = discord.ui.TextInput(
+        label="Welcome channel (type #channel, mention, or ID)",
+        placeholder="Examples: #welcome   <#123456789>   123456789   (leave blank = system/default)",
+        max_length=100,
         required=False,
     )
     welcome_message = discord.ui.TextInput(
         label="Welcome message",
-        placeholder="Example: Welcome {user_mention} to {server_name}!",
+        placeholder=(
+            "Example: Welcome {user_mention} to {server_name}!\n"
+            "Placeholders: {user_mention} {user_name} {server_name}"
+        ),
         style=discord.TextStyle.paragraph,
         max_length=1000,
     )
@@ -296,28 +326,25 @@ class SetupWelcomeModal(discord.ui.Modal, title="Set up welcome message"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
-        if interaction.user.id != interaction.guild.owner_id:
-            await interaction.response.send_message(
-                "Only the **server owner** can submit this form. "
-                "(Tip: use `/welcome set` if you want to allow admins too.)",
+        # Respond immediately to avoid Discord's 3s timeout.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not await _ensure_guild_manager(interaction):
+            return
+
+        raw_channel = str(self.welcome_channel.value or "")
+        channel_id = _parse_channel_reference(interaction.guild, raw_channel)
+        if raw_channel.strip() and channel_id is None:
+            await interaction.followup.send(
+                "I couldn't understand that channel.\n"
+                "Type `#channel`, paste a channel mention like `<#123...>`, or paste the channel ID.\n"
+                "Or leave it blank to use the server's system/default channel.",
                 ephemeral=True,
             )
             return
 
-        raw_cid = str(self.welcome_channel_id.value or "").strip()
-        channel_id: int | None
-        if raw_cid:
-            try:
-                channel_id = int(raw_cid)
-            except ValueError:
-                await interaction.response.send_message("Welcome channel ID must be a number.", ephemeral=True)
-                return
-        else:
-            channel_id = interaction.guild.system_channel.id if interaction.guild.system_channel else None
-
         template = str(self.welcome_message.value or "").strip()
         if not template:
-            await interaction.response.send_message("Welcome message cannot be empty.", ephemeral=True)
+            await interaction.followup.send("Welcome message cannot be empty.", ephemeral=True)
             return
 
         cfg: dict[str, Any] = {"enabled": True, "channel_id": channel_id, "template": template}
@@ -330,13 +357,14 @@ class SetupWelcomeModal(discord.ui.Modal, title="Set up welcome message"):
             welcome[str(interaction.guild.id)] = cfg
             await _save_reminders(data)
 
-        ch_desc = f"<#{channel_id}>" if channel_id else "(no channel set)"
+        # Channel to use for join events: configured channel, else system channel, else do nothing.
+        ch_desc = f"<#{channel_id}>" if isinstance(channel_id, int) else "(system/default channel)"
         preview_user = interaction.user if isinstance(interaction.user, discord.Member) else None
         preview = _render_welcome_template(template, preview_user) if preview_user else template
-        await interaction.response.send_message(
-            "Saved welcome settings.\n"
+        await interaction.followup.send(
+            "Welcome settings saved.\n"
             f"- Channel: {ch_desc}\n"
-            f"- Template preview: {preview}",
+            f"- Preview: {preview}",
             ephemeral=True,
         )
 
@@ -458,6 +486,13 @@ async def welcome_test(interaction: discord.Interaction) -> None:
 
 
 bot.tree.add_command(welcome_group)
+
+
+@welcome_group.command(name="setup", description="Owner/admin: open a popup to configure welcome settings")
+async def welcome_setup(interaction: discord.Interaction) -> None:
+    if not await _ensure_guild_manager(interaction):
+        return
+    await interaction.response.send_modal(SetupWelcomeModal())
 
 
 @bot.tree.command(name="disable-welcome", description="Server owner: disable welcome message for new members")
