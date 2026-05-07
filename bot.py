@@ -725,6 +725,234 @@ async def setup_reminder(interaction: discord.Interaction) -> None:
 reminder_group = app_commands.Group(name="reminder", description="Configure weekly reminders (easier setup)")
 
 
+class _ReminderSetupModal(discord.ui.Modal, title="Weekly reminder setup"):
+    message_link = discord.ui.TextInput(
+        label="Message link",
+        placeholder="Right-click message → Copy Message Link",
+        max_length=100,
+    )
+    schedule_utc = discord.ui.TextInput(
+        label="Weekly time (UTC)",
+        placeholder="Example: Friday 00:00",
+        max_length=32,
+    )
+
+    def __init__(self, *, requester_id: int) -> None:
+        super().__init__()
+        self.requester_id = requester_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if interaction.user.id != self.requester_id:
+            await interaction.followup.send("This setup popup isn't for you. Run `/reminder setup` yourself.", ephemeral=True)
+            return
+        if interaction.guild is None:
+            await interaction.followup.send("Use this command in a server.", ephemeral=True)
+            return
+
+        try:
+            link_guild_id, _link_channel_id, mid = _parse_message_link(str(self.message_link.value))
+        except ValueError as e:
+            await interaction.followup.send(str(e), ephemeral=True)
+            return
+        if link_guild_id != interaction.guild.id:
+            await interaction.followup.send("That message link is from a different server.", ephemeral=True)
+            return
+
+        try:
+            weekday, hour, minute = _parse_schedule(str(self.schedule_utc.value))
+        except ValueError as e:
+            await interaction.followup.send(str(e), ephemeral=True)
+            return
+
+        view = _ReminderSetupView(
+            requester_id=interaction.user.id,
+            guild_id=interaction.guild.id,
+            message_id=mid,
+            weekday=weekday,
+            hour=hour,
+            minute=minute,
+        )
+        wd_name = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][weekday]
+        await interaction.followup.send(
+            "Almost done — pick the role + ping channel, then choose emojis.\n"
+            f"- Message: `{mid}`\n"
+            f"- Weekly: **{wd_name}** at **{hour:02d}:{minute:02d} UTC**\n"
+            "Optional: click **Capture emojis** and react on the message with all emojis you want.\n"
+            "Finally click **Finish**.",
+            ephemeral=True,
+            view=view,
+        )
+
+
+class _ReminderSetupView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        requester_id: int,
+        guild_id: int,
+        message_id: int,
+        weekday: int,
+        hour: int,
+        minute: int,
+    ) -> None:
+        super().__init__(timeout=10 * 60)
+        self.requester_id = requester_id
+        self.guild_id = guild_id
+        self.message_id = message_id
+        self.weekday = weekday
+        self.hour = hour
+        self.minute = minute
+
+        self.selected_role_id: int | None = None
+        self.selected_channel_id: int | None = None
+        self.captured_emojis: set[str] = set()
+
+        self.role_select = discord.ui.RoleSelect(placeholder="Pick the role to assign + ping", min_values=1, max_values=1)
+        self.role_select.callback = self._on_role  # type: ignore[assignment]
+        self.add_item(self.role_select)
+
+        self.channel_select = discord.ui.ChannelSelect(
+            placeholder="Pick the channel to send weekly pings",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+        )
+        self.channel_select.callback = self._on_channel  # type: ignore[assignment]
+        self.add_item(self.channel_select)
+
+    async def _on_role(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the person who started setup can change this.", ephemeral=True)
+            return
+        values = getattr(self.role_select, "values", [])
+        self.selected_role_id = int(values[0].id) if values else None
+        await interaction.response.send_message("Role selected.", ephemeral=True)
+
+    async def _on_channel(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the person who started setup can change this.", ephemeral=True)
+            return
+        values = getattr(self.channel_select, "values", [])
+        self.selected_channel_id = int(values[0].id) if values else None
+        await interaction.response.send_message("Channel selected.", ephemeral=True)
+
+    @discord.ui.button(label="Capture emojis", style=discord.ButtonStyle.blurple)
+    async def capture_emojis(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the person who started setup can use this.", ephemeral=True)
+            return
+        if interaction.guild is None or interaction.guild.id != self.guild_id:
+            await interaction.response.send_message("This setup is for a different server.", ephemeral=True)
+            return
+        _optin_capture_state[(self.requester_id, self.guild_id)] = {
+            "message_id": self.message_id,
+            "mode": "reminder_emojis",
+            "role_id": None,
+            "emojis": self.captured_emojis,
+        }
+        await interaction.response.send_message(
+            "Emoji capture is ON.\n"
+            "React on the target message with every emoji you want to use.\n"
+            "Then come back and click **Finish**.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Finish", style=discord.ButtonStyle.green)
+    async def finish(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the person who started setup can finish.", ephemeral=True)
+            return
+        if interaction.guild is None or interaction.guild.id != self.guild_id:
+            await interaction.response.send_message("This setup is for a different server.", ephemeral=True)
+            return
+        if self.selected_role_id is None:
+            await interaction.response.send_message("Pick a role first.", ephemeral=True)
+            return
+        if self.selected_channel_id is None:
+            await interaction.response.send_message("Pick a ping channel first.", ephemeral=True)
+            return
+
+        role = interaction.guild.get_role(self.selected_role_id)
+        if role is None:
+            await interaction.response.send_message("That role no longer exists.", ephemeral=True)
+            return
+        channel = interaction.guild.get_channel(self.selected_channel_id)
+        if not isinstance(channel, discord.abc.Messageable):
+            await interaction.response.send_message("That channel is not a text channel.", ephemeral=True)
+            return
+
+        bot_member = interaction.guild.me
+        if bot_member is None:
+            await interaction.response.send_message("Bot member not available.", ephemeral=True)
+            return
+        if role >= bot_member.top_role and interaction.guild.owner_id != bot_member.id:
+            await interaction.response.send_message(
+                f"Move the bot's role **above** {role.mention} in Server Settings → Roles.",
+                ephemeral=True,
+            )
+            return
+
+        emoji_list: list[str | None]
+        if self.captured_emojis:
+            emoji_list = list(self.captured_emojis)
+        else:
+            emoji_list = [None]
+
+        created_ids: list[str] = []
+        async with _reminder_lock:
+            data = await _load_reminders()
+            for e in emoji_list:
+                rid_str = str(uuid.uuid4())
+                data["reminders"].append(
+                    {
+                        "id": rid_str,
+                        "guild_id": self.guild_id,
+                        "message_id": self.message_id,
+                        "emoji": e,
+                        "weekday": self.weekday,
+                        "hour": self.hour,
+                        "minute": self.minute,
+                        "role_id": int(role.id),
+                        "channel_id": int(channel.id),
+                        "last_fired_slot": None,
+                    }
+                )
+                created_ids.append(rid_str)
+            await _save_reminders(data)
+
+        wd_name = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][self.weekday]
+        emoji_desc = "any emoji" if emoji_list == [None] else ", ".join([str(x) for x in emoji_list if x])
+        await interaction.response.send_message(
+            "Saved reminder(s).\n"
+            f"- Message: `{self.message_id}`\n"
+            f"- Emojis: {emoji_desc}\n"
+            f"- Weekly: **{wd_name}** at **{self.hour:02d}:{self.minute:02d} UTC**\n"
+            f"- Role: {role.mention}\n"
+            f"- Ping channel: {channel.mention}\n"
+            f"- Created: {len(created_ids)} reminder(s)",
+            ephemeral=True,
+        )
+        _optin_capture_state.pop((self.requester_id, self.guild_id), None)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.gray)
+    async def cancel(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the person who started setup can cancel.", ephemeral=True)
+            return
+        await interaction.response.send_message("Cancelled reminder setup.", ephemeral=True)
+        _optin_capture_state.pop((self.requester_id, self.guild_id), None)
+        self.stop()
+
+
+@reminder_group.command(name="setup", description="Owner/admin: guided setup (popup + pickers + emoji capture)")
+async def reminder_setup(interaction: discord.Interaction) -> None:
+    if not await _ensure_guild_manager(interaction):
+        return
+    await interaction.response.send_modal(_ReminderSetupModal(requester_id=interaction.user.id))
+
+
 @reminder_group.command(name="add", description="Owner/admin: add a weekly reminder (supports multiple emojis)")
 @app_commands.describe(
     message_link="Copy Message Link from the target message",
@@ -879,10 +1107,21 @@ class _OptInRolePickerView(discord.ui.View):
         self.captured_emojis: set[str] = set()
         # Pending mappings: emoji string -> role_id
         self.emoji_to_role: dict[str, int] = {}
+        self._last_status: str = "Pick a role to start."
 
         self.role_select = discord.ui.RoleSelect(placeholder="Pick a role to map", min_values=1, max_values=1)
         self.role_select.callback = self._on_roles_selected  # type: ignore[assignment]
         self.add_item(self.role_select)
+
+    def _render(self) -> str:
+        pairs = "\n".join([f"- {e} → <@&{rid}>" for e, rid in list(self.emoji_to_role.items())[:10]])
+        mapped = f"\n\nCurrent mappings:\n{pairs}" if pairs else ""
+        return (
+            "Create emoji→role mappings.\n"
+            f"- Message: `{self.message_id}`\n\n"
+            f"Status: {self._last_status}"
+            f"{mapped}"
+        )
 
     async def _on_roles_selected(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.requester_id:
@@ -890,10 +1129,8 @@ class _OptInRolePickerView(discord.ui.View):
             return
         values = getattr(self.role_select, "values", [])
         self.selected_role_id = int(values[0].id) if values else None
-        await interaction.response.send_message(
-            "Role selected. Click **Capture emoji** to record the emoji for this role.",
-            ephemeral=True,
-        )
+        self._last_status = "Role selected. Click **Capture emoji** and react once on the target message."
+        await interaction.response.edit_message(content=self._render(), view=self)
 
     @discord.ui.button(label="Capture emoji", style=discord.ButtonStyle.blurple)
     async def capture_emoji(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
@@ -904,7 +1141,8 @@ class _OptInRolePickerView(discord.ui.View):
             await interaction.response.send_message("This setup is for a different server.", ephemeral=True)
             return
         if self.selected_role_id is None:
-            await interaction.response.send_message("Pick a role first.", ephemeral=True)
+            self._last_status = "Pick a role first (use the dropdown)."
+            await interaction.response.edit_message(content=self._render(), view=self)
             return
         _optin_capture_state[(self.requester_id, self.guild_id)] = {
             "message_id": self.message_id,
@@ -912,12 +1150,8 @@ class _OptInRolePickerView(discord.ui.View):
             "role_id": self.selected_role_id,
             "emojis": self.captured_emojis,
         }
-        await interaction.response.send_message(
-            "Emoji capture is ON.\n"
-            "Now react **once** on the target message with the emoji for the selected role.\n"
-            "Then come back and click **Add mapping**.",
-            ephemeral=True,
-        )
+        self._last_status = "Emoji capture ON. React once on the message, then click **Add mapping**."
+        await interaction.response.edit_message(content=self._render(), view=self)
 
     @discord.ui.button(label="Add mapping", style=discord.ButtonStyle.green)
     async def add_mapping(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
@@ -928,20 +1162,20 @@ class _OptInRolePickerView(discord.ui.View):
             await interaction.response.send_message("This setup is for a different server.", ephemeral=True)
             return
         if self.selected_role_id is None:
-            await interaction.response.send_message("Pick a role first.", ephemeral=True)
+            self._last_status = "Pick a role first (use the dropdown)."
+            await interaction.response.edit_message(content=self._render(), view=self)
             return
         if not self.captured_emojis:
-            await interaction.response.send_message("No emoji captured yet. Click **Capture emoji** and react once.", ephemeral=True)
+            self._last_status = "No emoji captured yet. Click **Capture emoji** and react once."
+            await interaction.response.edit_message(content=self._render(), view=self)
             return
 
         # Use the most recently captured emoji for the current role.
         captured = list(self.captured_emojis)
         emoji = captured[-1]
         self.emoji_to_role[emoji] = self.selected_role_id
-        await interaction.response.send_message(
-            f"Mapped {emoji} → <@&{self.selected_role_id}>. Pick another role and repeat, or click **Finish**.",
-            ephemeral=True,
-        )
+        self._last_status = f"Mapped {emoji} → <@&{self.selected_role_id}>. Pick another role to continue."
+        await interaction.response.edit_message(content=self._render(), view=self)
 
     @discord.ui.button(label="Finish", style=discord.ButtonStyle.green)
     async def finish(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
@@ -1007,7 +1241,7 @@ class _OptInRolePickerView(discord.ui.View):
         if interaction.user.id != self.requester_id:
             await interaction.response.send_message("Only the person who started setup can cancel this.", ephemeral=True)
             return
-        await interaction.response.send_message("Cancelled opt-in setup.", ephemeral=True)
+        await interaction.response.edit_message(content="Cancelled opt-in setup.", view=None)
         _optin_capture_state.pop((self.requester_id, self.guild_id), None)
         self.stop()
 
@@ -1322,13 +1556,17 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if payload.user_id == bot.user.id:  # type: ignore[union-attr]
         return
 
-    # If a server owner/admin is in the opt-in setup wizard, capture emojis they react with.
+    # If a server owner/admin is in a setup wizard, capture emojis they react with.
     state = _optin_capture_state.get((payload.user_id, payload.guild_id))
     if isinstance(state, dict) and int(state.get("message_id", 0)) == payload.message_id:
+        mode = str(state.get("mode") or "")
         emojis = state.get("emojis")
         if isinstance(emojis, set):
             emojis.add(str(payload.emoji))
-        return
+        # For reminder emoji capture, we don't want to stop normal processing; but for opt-in mapping
+        # we also don't want to auto-assign roles while the admin is configuring. So:
+        if mode in {"reminder_emojis", "optin_role_map"}:
+            return
 
     guild = bot.get_guild(payload.guild_id)
     if guild is None:
