@@ -1189,7 +1189,13 @@ class _OptInRolePickerView(discord.ui.View):
         self.emoji_to_role[emoji] = int(self.selected_role_id)
         # Clear capture so the next mapping requires an explicit capture click.
         _optin_capture_state.pop((self.requester_id, self.guild_id), None)
-        await interaction.response.edit_message(content=self._render(), view=self)
+        # Reset selection so the next role pick is clean.
+        self.selected_role_id = None
+        self._last_status = f"Mapped {emoji}. Pick the next role."
+        # Only refresh the components; avoid frequent content edits which can cause client jumps.
+        await interaction.response.edit_message(view=self)
+        # Send a lightweight ephemeral confirmation (doesn't move the original setup message).
+        await interaction.followup.send(f"Saved mapping: {emoji} → <@&{self.emoji_to_role[emoji]}>", ephemeral=True)
 
     @discord.ui.button(label="Finish", style=discord.ButtonStyle.green)
     async def finish(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
