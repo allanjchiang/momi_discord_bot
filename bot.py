@@ -810,6 +810,166 @@ bot.tree.add_command(reminder_group)
 optin_group = app_commands.Group(name="optin", description="Opt-in roles via reacting to a message")
 
 
+class _OptInSetupModal(discord.ui.Modal, title="Opt-in roles (reaction → role)"):
+    message_link = discord.ui.TextInput(
+        label="Message link",
+        placeholder="Right-click message → Copy Message Link",
+        max_length=100,
+    )
+    emojis = discord.ui.TextInput(
+        label="Emojis (comma-separated, optional)",
+        placeholder="✅, 🐶  (blank = any emoji)",
+        max_length=100,
+        required=False,
+    )
+
+    def __init__(self, *, requester_id: int) -> None:
+        super().__init__()
+        self.requester_id = requester_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Acknowledge quickly, then show a role picker.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if interaction.user.id != self.requester_id:
+            await interaction.followup.send("This setup popup isn't for you. Run `/optin setup` yourself.", ephemeral=True)
+            return
+        if interaction.guild is None:
+            await interaction.followup.send("Use this command in a server.", ephemeral=True)
+            return
+        try:
+            link_guild_id, _link_channel_id, mid = _parse_message_link(str(self.message_link.value))
+        except ValueError as e:
+            await interaction.followup.send(str(e), ephemeral=True)
+            return
+        if link_guild_id != interaction.guild.id:
+            await interaction.followup.send("That message link is from a different server.", ephemeral=True)
+            return
+
+        emoji_list = _parse_emoji_list(str(self.emojis.value or ""))
+        view = _OptInRolePickerView(
+            requester_id=interaction.user.id,
+            guild_id=interaction.guild.id,
+            message_id=mid,
+            emoji_list=emoji_list,
+        )
+        emoji_desc = "any emoji" if emoji_list == [None] else ", ".join([str(x) for x in emoji_list if x])
+        await interaction.followup.send(
+            "Almost done — pick the role(s) members should get.\n"
+            f"- Message: `{mid}`\n"
+            f"- Emojis: {emoji_desc}\n"
+            "Then click **Save**.",
+            ephemeral=True,
+            view=view,
+        )
+
+
+class _OptInRolePickerView(discord.ui.View):
+    def __init__(self, *, requester_id: int, guild_id: int, message_id: int, emoji_list: list[str | None]) -> None:
+        super().__init__(timeout=10 * 60)
+        self.requester_id = requester_id
+        self.guild_id = guild_id
+        self.message_id = message_id
+        self.emoji_list = emoji_list
+        self.selected_role_ids: list[int] = []
+
+        role_select = discord.ui.RoleSelect(
+            placeholder="Select role(s) to grant on reaction",
+            min_values=1,
+            # Discord UI limit is 25 selections per select menu.
+            max_values=25,
+        )
+        role_select.callback = self._on_roles_selected  # type: ignore[assignment]
+        self.add_item(role_select)
+
+    async def _on_roles_selected(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the person who started setup can change this.", ephemeral=True)
+            return
+        item = self.children[0]
+        values = getattr(item, "values", [])
+        self.selected_role_ids = [int(r.id) for r in values]
+        await interaction.response.send_message(
+            f"Selected {len(self.selected_role_ids)} role(s). Click **Save** below.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Save", style=discord.ButtonStyle.green)
+    async def save(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the person who started setup can save this.", ephemeral=True)
+            return
+        if interaction.guild is None or interaction.guild.id != self.guild_id:
+            await interaction.response.send_message("This setup is for a different server.", ephemeral=True)
+            return
+        if not self.selected_role_ids:
+            await interaction.response.send_message("Pick at least one role first.", ephemeral=True)
+            return
+
+        bot_member = interaction.guild.me
+        if bot_member is None:
+            await interaction.response.send_message("Bot member not available.", ephemeral=True)
+            return
+        for rid in self.selected_role_ids:
+            role = interaction.guild.get_role(rid)
+            if role is None:
+                continue
+            if role >= bot_member.top_role and interaction.guild.owner_id != bot_member.id:
+                await interaction.response.send_message(
+                    f"Move the bot's role **above** {role.mention} in Server Settings → Roles.",
+                    ephemeral=True,
+                )
+                return
+
+        created_ids: list[str] = []
+        async with _reminder_lock:
+            data = await _load_reminders()
+            rows = data.get("opt_in_roles")
+            if not isinstance(rows, list):
+                rows = []
+                data["opt_in_roles"] = rows
+            for rid in self.selected_role_ids:
+                for e in self.emoji_list:
+                    oid = str(uuid.uuid4())
+                    rows.append(
+                        {
+                            "id": oid,
+                            "guild_id": self.guild_id,
+                            "message_id": self.message_id,
+                            "emoji": e,
+                            "role_id": rid,
+                        }
+                    )
+                    created_ids.append(oid)
+            await _save_reminders(data)
+
+        emoji_desc = "any emoji" if self.emoji_list == [None] else ", ".join([str(x) for x in self.emoji_list if x])
+        roles_desc = ", ".join([f"<@&{rid}>" for rid in self.selected_role_ids])
+        await interaction.response.send_message(
+            "Saved opt-in role rule(s).\n"
+            f"- Message: `{self.message_id}`\n"
+            f"- Emojis: {emoji_desc}\n"
+            f"- Roles: {roles_desc}\n"
+            f"- Created: {len(created_ids)} rule(s)",
+            ephemeral=True,
+        )
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.gray)
+    async def cancel(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the person who started setup can cancel this.", ephemeral=True)
+            return
+        await interaction.response.send_message("Cancelled opt-in setup.", ephemeral=True)
+        self.stop()
+
+
+@optin_group.command(name="setup", description="Owner/admin: guided setup (popup + role picker)")
+async def optin_setup(interaction: discord.Interaction) -> None:
+    if not await _ensure_guild_manager(interaction):
+        return
+    await interaction.response.send_modal(_OptInSetupModal(requester_id=interaction.user.id))
+
+
 @optin_group.command(name="add", description="Owner/admin: create opt-in role(s) for emoji reactions")
 @app_commands.describe(
     message_link="Copy Message Link from the target message",
