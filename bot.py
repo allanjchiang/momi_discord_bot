@@ -605,8 +605,8 @@ class SetupReminderModal(discord.ui.Modal, title="Set up weekly reminder"):
         max_length=22,
     )
     reaction_emoji = discord.ui.TextInput(
-        label="Reaction emoji (leave blank = any emoji)",
-        placeholder="e.g. 🐕 or <:name:123456789>",
+        label="Reaction emoji(s) (comma-separated)",
+        placeholder="Example: ✅, 🐕, <:name:123456789>  (blank=any)",
         max_length=100,
         required=False,
     )
@@ -654,7 +654,8 @@ class SetupReminderModal(discord.ui.Modal, title="Set up weekly reminder"):
                 await interaction.response.send_message("Could not determine this channel.", ephemeral=True)
                 return
 
-        emoji_val = str(self.reaction_emoji.value or "").strip() or None
+        emoji_raw = str(self.reaction_emoji.value or "")
+        emoji_list = _parse_emoji_list(emoji_raw)
 
         try:
             weekday, hour, minute = _parse_schedule(str(self.schedule_utc.value))
@@ -682,30 +683,34 @@ class SetupReminderModal(discord.ui.Modal, title="Set up weekly reminder"):
             )
             return
 
-        rid_str = str(uuid.uuid4())
-        row = {
-            "id": rid_str,
-            "guild_id": interaction.guild.id,
-            "message_id": mid,
-            "emoji": emoji_val,
-            "weekday": weekday,
-            "hour": hour,
-            "minute": minute,
-            "role_id": rid,
-            "channel_id": cid,
-            "last_fired_slot": None,
-        }
-
+        created_ids: list[str] = []
         async with _reminder_lock:
             data = await _load_reminders()
-            data["reminders"].append(row)
+            for emoji_val in emoji_list:
+                rid_str = str(uuid.uuid4())
+                row = {
+                    "id": rid_str,
+                    "guild_id": interaction.guild.id,
+                    "message_id": mid,
+                    "emoji": emoji_val,
+                    "weekday": weekday,
+                    "hour": hour,
+                    "minute": minute,
+                    "role_id": rid,
+                    "channel_id": cid,
+                    "last_fired_slot": None,
+                }
+                data["reminders"].append(row)
+                created_ids.append(rid_str)
             await _save_reminders(data)
 
         wd_name = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][weekday]
+        emoji_desc = "any emoji" if emoji_list == [None] else ", ".join([str(x) for x in emoji_list if x])
         await interaction.response.send_message(
-            f"Saved reminder **`{rid_str[:8]}…`**\n"
-            f"- React message `{mid}` with {emoji_val or 'any emoji'} → assign role {role.mention}\n"
-            f"- Every **{wd_name}** at **{hour:02d}:{minute:02d} UTC** → ping in {channel.mention}",
+            "Saved reminder(s).\n"
+            f"- React message `{mid}` with {emoji_desc} → assign role {role.mention}\n"
+            f"- Every **{wd_name}** at **{hour:02d}:{minute:02d} UTC** → ping in {channel.mention}\n"
+            f"- IDs: {', '.join([cid_[:8] + '…' for cid_ in created_ids])}",
             ephemeral=True,
         )
 
