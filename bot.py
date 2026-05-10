@@ -327,6 +327,75 @@ def _get_welcome_config(data: dict[str, Any], guild_id: int) -> dict[str, Any] |
     return cfg
 
 
+def _coerce_channel_id(raw: Any) -> int | None:
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str) and raw.strip().isdigit():
+        return int(raw.strip())
+    return None
+
+
+def _first_sendable_text_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    me = guild.me
+    if me is None:
+        return None
+    for ch in guild.text_channels:
+        perms = ch.permissions_for(me)
+        if perms.view_channel and perms.send_messages:
+            return ch
+    return None
+
+
+def _resolve_welcome_channel(guild: discord.Guild, cfg: dict[str, Any]) -> discord.abc.Messageable | None:
+    """
+    Pick a channel to post welcome messages.
+    Order: configured channel (if bot can post), system channel, rules channel, first text channel we can post in.
+    """
+    me = guild.me
+    if me is None:
+        return None
+
+    def usable(ch: discord.abc.Messageable | None) -> discord.abc.Messageable | None:
+        if ch is None:
+            return None
+        if isinstance(ch, discord.TextChannel):
+            p = ch.permissions_for(me)
+            if not p.view_channel or not p.send_messages:
+                return None
+            return ch
+        if isinstance(ch, discord.Thread):
+            p = ch.permissions_for(me)
+            if not p.send_messages_in_threads:
+                return None
+            return ch
+        if isinstance(ch, discord.abc.Messageable):
+            return ch
+        return None
+
+    seen: set[int] = set()
+    ordered: list[discord.abc.Messageable | None] = []
+
+    cid = _coerce_channel_id(cfg.get("channel_id"))
+    if cid is not None:
+        ch = guild.get_channel(cid)
+        ordered.append(usable(ch) if isinstance(ch, discord.abc.Messageable) else None)
+
+    ordered.append(usable(guild.system_channel))
+    rules = getattr(guild, "rules_channel", None)
+    ordered.append(usable(rules))
+    ordered.append(_first_sendable_text_channel(guild))
+
+    for ch in ordered:
+        if ch is None:
+            continue
+        hid = ch.id if hasattr(ch, "id") else id(ch)
+        if hid in seen:
+            continue
+        seen.add(int(hid))
+        return ch
+    return None
+
+
 _MSG_LINK_RE = re.compile(r"discord\.com/channels/(\d+)/(\d+)/(\d+)")
 
 
@@ -1478,12 +1547,19 @@ async def help_reminder(interaction: discord.Interaction) -> None:
 async def on_ready() -> None:
     assert bot.user is not None
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
+    if intents.members:
+        print(
+            "Welcome on join: members intent is ON in code — also enable **Privileged Gateway Intent → "
+            "Server Members Intent** in the Discord Developer Portal, or join events will not arrive."
+        )
     if not reminder_tick.is_running():
         reminder_tick.start()
 
 
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
+    if member.bot:
+        return
     data = await _load_reminders()
     cfg = _get_welcome_config(data, member.guild.id)
     if not cfg or not cfg.get("enabled", True):
@@ -1492,26 +1568,23 @@ async def on_member_join(member: discord.Member) -> None:
     if not template:
         return
 
-    channel: discord.abc.Messageable | None = None
-    channel_id = cfg.get("channel_id")
-    if isinstance(channel_id, int):
-        ch = member.guild.get_channel(channel_id)
-        if isinstance(ch, discord.abc.Messageable):
-            channel = ch
+    channel = _resolve_welcome_channel(member.guild, cfg)
     if channel is None:
-        sys_ch = member.guild.system_channel
-        if isinstance(sys_ch, discord.abc.Messageable):
-            channel = sys_ch
-    if channel is None:
+        print(
+            f"Welcome skipped for guild {member.guild.id}: no channel with Send Messages "
+            "(set a welcome channel, set a system channel, or give the bot a text channel it can post in)."
+        )
         return
 
     try:
         await channel.send(_render_welcome_template(template, member))
-    except discord.HTTPException:
-        return
+    except discord.HTTPException as e:
+        print(f"Welcome send failed in guild {member.guild.id} channel {getattr(channel, 'id', '?')}: {e}")
 
 
-@tasks.loop(minutes=1)
+# Wall-clock minute can be skipped if we only sleep 60s after each run (drift + long iterations).
+# Tick twice per minute so the scheduled weekday/hour/minute always matches at least once.
+@tasks.loop(seconds=30)
 async def reminder_tick() -> None:
     now = dt.datetime.now(dt.timezone.utc)
     slot = now.strftime("%Y-%m-%d %H:%M")
@@ -1560,7 +1633,8 @@ async def reminder_tick() -> None:
                 f"<@&{role_id}> Reminder (configured by server owner).",
                 allowed_mentions=discord.AllowedMentions(roles=True),
             )
-        except discord.HTTPException:
+        except discord.HTTPException as e:
+            print(f"Weekly reminder send failed (role {role_id}, channel {getattr(channel, 'id', '?')}): {e}")
             continue
 
 
